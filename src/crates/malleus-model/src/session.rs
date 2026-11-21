@@ -58,6 +58,9 @@ pub struct Session {
     /// and the n-gram context before the step with the step's tokens.
     pub(crate) ple_snap: Option<DeviceBuffer>,
     pub(crate) ngram_prev: Vec<u32>,
+    /// Inkling-2's decode state: one KV slot per layer and pass, the histories of its short convolutions, the bias
+    /// row of the current query. Its own graph, not the `kv`/`conv` of the carried families.
+    pub(crate) inkling2: Option<Box<crate::inkling2::Cache>>,
     /// Hy4's DFly2: what the next draft block reads from the target's last call.
     pub(crate) hy4_spec: Option<Box<crate::hy4::SpecState>>,
     pub(crate) hy4_draft: crate::hy4::DraftStats,

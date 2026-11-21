@@ -569,6 +569,7 @@ impl Model {
             idx_list: None,
             ple_snap: None,
             ngram_prev: vec![],
+            inkling2: None,
             hy4_spec: None,
             hy4_draft: Default::default(),
             ix_tk: vec![],
@@ -634,6 +635,9 @@ impl Model {
                 .push((DeviceBuffer::zeroed(kv_bytes)?, DeviceBuffer::zeroed(v_bytes)?));
             s.mtp_h = Some(f32s(GEMV_MAX_T * c.stream_dim())?);
             s.mtp_out = Some(f32s(c.stream_dim())?);
+        }
+        if self.inkling2.is_some() {
+            s.inkling2 = Some(Box::new(crate::inkling2::Cache::new(self, max_ctx)?));
         }
         Ok(s)
     }
@@ -757,6 +761,9 @@ impl Model {
         s.snap_t = 0;
         s.dn_np = 0;
         s.idx_cache_len = 0;
+        if let Some(c) = s.inkling2.as_mut() {
+            c.reset()?;
+        }
         Ok(())
     }
 
@@ -778,6 +785,9 @@ impl Model {
         s.mtp_pos.clear();
         s.mtp_chain = 0;
         s.idx_cache_len = 0;
+        if let Some(c) = s.inkling2.as_mut() {
+            c.reset()?;
+        }
         Ok(())
     }
 
@@ -1467,8 +1477,8 @@ impl Model {
         Ok(())
     }
 
-    /// Inkling-2's standalone generation: run the whole sequence for every new token (the correctness path,
-    /// O(n^2) without a KV cache). Returns the generated ids after `tokens`.
+    /// Inkling-2's standalone generation: the prompt in one forward, then a token at a time against a cache of its
+    /// own. Returns the generated ids after `tokens`.
     pub fn inkling2_generate(&self, tokens: &[u32], n: usize) -> Result<Vec<u32>> {
         crate::inkling2::generate(self, tokens, n)
     }
@@ -1482,6 +1492,15 @@ impl Model {
         positions: Option<&[[i32; 3]]>,
         n_logits: usize,
     ) -> Result<Vec<f32>> {
+        // Inkling-2's release graph is the looped forward in `crate::inkling2`, not the generic stack: the
+        // generic path's layer/state bookkeeping does not describe its 48 KV slots.
+        if self.inkling2.is_some() {
+            let cache = sess.inkling2.as_deref_mut().context("inkling2 session")?;
+            let all = crate::inkling2::logits(self, Some(cache), tokens)?;
+            let vocab = self.cfg.vocab;
+            let start = all.len().saturating_sub(n_logits * vocab);
+            return Ok(all[start..].to_vec());
+        }
         self.forward_mm(sess, tokens, positions, n_logits, &[])
     }
 
@@ -1500,6 +1519,20 @@ impl Model {
     /// One-token greedy step: the argmax is computed on the device and only the token id comes back. The
     /// logits never cross the bus; `forward` keeps the full row for sampling and verification.
     pub fn forward_argmax(&self, sess: &mut Session, tokens: &[u32]) -> Result<u32> {
+        if self.inkling2.is_some() {
+            // The one-token path's argmax: the cache holds the prompt, so the row does not cross the bus twice.
+            let all = self.forward(sess, tokens, None, 1)?;
+            let i = self.cfg.inkling2.as_ref().context("inkling2 config")?;
+            let mut bi = 0u32;
+            let mut bv = f32::NEG_INFINITY;
+            for (j, &x) in all.iter().take(i.unpadded_vocab).enumerate() {
+                if x > bv {
+                    bv = x;
+                    bi = j as u32;
+                }
+            }
+            return Ok(bi);
+        }
         let v = self.forward_impl(sess, tokens, None, 1, &[], false, true)?;
         Ok(v[0] as u32)
     }

@@ -34,6 +34,7 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
+| Inkling-2-Mini (text) | `Inkling-2-Mini-mls4.malleus` | 15.3 GB | no | The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. Session state is 393 KiB per token (48 KV slots); no MTP wiring yet. |
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
@@ -184,6 +185,66 @@ quality is being traded for the prefill speed.
 The KL column is not the same number: Malleus computes it over the whole vocabulary, `bench/quality_api.py` only
 over the reference top-10 (the rest charged at the floor of what the engine returned), which is a lower bound by
 construction. Compare the top-1 and the greedy tokens, not the KL.
+
+## Inkling-2-Mini — the looped transformer (2026-11-21)
+
+A 15.3 GB MLS4 file of a **looped** model: 24 physical layers of which the middle 12 (`6..18`) run three passes,
+so a token costs 48 layer visits — three times the expert traffic of a stack of the same depth. Attention residuals
+over a running block stack, a kernel-4 short convolution on every layer input and output, a relative-position bias
+over the last 1024 positions, 128 experts with 8 active, and an 8-bit head over a 201 024-token vocabulary.
+Measured on gfx1150 (Radeon 890M), `malleus bench --prompt 512,2048 --decode 32`, with the decode running against
+the KV cache (48 slots, one per layer and pass).
+
+| | value |
+|---|---|
+| weights on the device | 14.41 GB text + 0.64 GB vision + 0.27 GB (MTP, loaded, not used yet) |
+| session state | 393 KiB per token: 48 slots × 8 KV heads × 128 × fp32 for K and V, plus the convolution histories |
+| prefill `pp512` / `pp2048` | **38.3** / **28.9** tok/s |
+| decode `tg32` at ctx 512 / ctx 2048 | **12.8** / **9.6** tok/s |
+
+The prefill is the open problem: the attention is one block per (token, head) with the scores in shared memory, and
+the relative bias costs a 16-term dot product per (head, query, key) pair on every layer, so the two are the wall at
+depth. There is no tiling yet and no chunked prefill: a prompt goes through one forward (`malleus eval` and the
+server use the whole prompt), so a context past ~8K needs more GTT than the graph asks for at 4K.
+
+**Against the production model** (Ornith-1.5-35B-A3B, same machine, `malleus bench`): prefill 38.3 against 968.5
+tok/s at depth 0, decode 12.8 against 29.08 (MTP off on both sides). The loop explains most of it — 48 layer visits
+instead of 40 — and the rest is the un-tiled attention; it is a smaller file (15.3 GB against 20.3 GB) with a
+smaller active set (8 of 128 experts, 1152-wide), so the bytes per token are not the limit.
+
+### Quality: the gates against the bf16 checkpoint
+
+`golden` on the 20 prompts of `golden/inkling2` (`scripts/golden.py --reasoning-effort none` on the bf16 checkpoint,
+the looped forward), greedy off:
+
+| metric | prefill (one forward) | decode (one token at a time, through the cache) |
+|---|---|---|
+| last-token top-1 against bf16 | **20/20** | **20/20** |
+| all-position argmax | 68.09 % (495/727) | 67.81 % (493/727) |
+| worst KL | 0.345 (`raw-continue`); 1e-5…1e-4 on the other 19 | 0.302 |
+
+`raw-continue` is the one prompt of the set that is not rendered through the chat template, and the only one whose
+KL is not in the 1e-5 range: it is where the file's 4 bits show. The prefill and the decode path agree on it, which
+is the property `--decode` exists to check.
+
+`eval` on the 8 documents of the eval set (four Gutenberg books, two source files, two chat continuations):
+
+| document | ppl (ref) | top-1 | KL |
+|---|---|---|---|
+| it-pg56775 | 13.044 (12.723) | 90.92 % | 0.0274 |
+| it-pg18456 | 9.133 (8.979) | 91.50 % | 0.0262 |
+| en-pg48320 | 7.319 (6.949) | 91.60 % | 0.0492 |
+| en-pg11 | 5.452 (5.257) | 92.09 % | 0.0266 |
+| code-utils | 1.982 (1.912) | 96.19 % | 0.0296 |
+| code-module | 2.234 (2.182) | 95.51 % | 0.0236 |
+| chat-it | 55.195 (29.000) | 76.46 % | 0.4075 |
+| chat-en | 45.716 (40.006) | 83.01 % | 0.1727 |
+| **total** | **9.240 (8.188, +12.85 %)** | **89.66 %** | **0.0954** |
+
+The two chat documents are the outliers (+90 % and +14 % perplexity against +1.7…+5.3 % for the six plain ones) and
+they are the only documents over 1 000 tokens whose tokens are *not* plain prose: they open with the reasoning-effort
+system line of the chat template. Open question, tracked in issue #70.
+
 
 ## How these numbers are produced
 

@@ -52,9 +52,11 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_l2_clip(float* y, con
     __shared__ float ss[128];
     const int row = blockIdx.x;  // token * heads + head
     const int r = threadIdx.x;
-    if (r >= dim) return;
+    // Lanes past `dim` (the relative-bias stream is 16 wide) contribute nothing to the tree below and write
+    // nothing back: returning early used to leave their `ss` slots to whatever the previous launch left there.
+    const bool live = r < dim;
     const int t = row / heads;
-    const float v = x[(size_t)row * dim + r] * scale[(size_t)(row % heads) * dim + r];
+    const float v = live ? x[(size_t)row * dim + r] * scale[(size_t)(row % heads) * dim + r] : 0.f;
     ss[r] = v * v;
     __syncthreads();
     for (int o = 64; o > 0; o >>= 1) {
@@ -63,7 +65,7 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_l2_clip(float* y, con
     }
     const float norm = sqrtf(ss[0]);
     const float k = min(1.f, thr / (norm + 1e-6f)) * (tau ? tau[t] : 1.f);
-    y[(size_t)row * dim + r] = v * k;
+    if (live) y[(size_t)row * dim + r] = v * k;
 }
 
 // Unweighted RMSNorm over the last dim: y = x / sqrt(mean(x^2) + eps).
@@ -72,15 +74,15 @@ extern "C" __global__ void __launch_bounds__(128) inkling2_rms_unnorm(float* y, 
     __shared__ float ss[128];
     const int row = blockIdx.x;
     const int r = threadIdx.x;
-    if (r >= dim) return;
-    const float v = x[(size_t)row * dim + r];
+    const bool live = r < dim;
+    const float v = live ? x[(size_t)row * dim + r] : 0.f;
     ss[r] = v * v;
     __syncthreads();
     for (int o = 64; o > 0; o >>= 1) {
         if (r < o) ss[r] += ss[r + o];
         __syncthreads();
     }
-    y[(size_t)row * dim + r] = v * rsqrtf(ss[0] / dim + eps);
+    if (live) y[(size_t)row * dim + r] = v * rsqrtf(ss[0] / dim + eps);
 }
 
 // bias[head][q][s] = rel[q][head] . proj[:, s - q] when 0 <= q - s < rel_extent, else 0.
@@ -252,11 +254,16 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_moe_route(int* ids, f
 
 // The expert activation: softcap(gate) * sigmoid(gate) * softcap(up), with softcap(x) = tanh(x / c) * c, then the
 // randomized Hadamard of every 128-block like moe_act (the down weights are in the rotated basis).
+//
+// The checkpoint stores `w13` interleaved (`g0, u0, g1, u1, ...`): the reference deinterleaves it with
+// `Interleave(dim=1)` before splitting the gate and the up. The MLS4 file keeps the checkpoint's row order, so the
+// gate of element `j` is row `2j` and the up is row `2j+1`.
 extern "C" __global__ void __launch_bounds__(128) inkling2_moe_act(float* out, const float* gu, const int8_t* signs,
                                                                   int I, float gate_cap, float up_cap) {
     __shared__ float s[128];
     const int nb = I / 128, p = blockIdx.x / nb, b = blockIdx.x % nb, i = threadIdx.x;
-    const float g = gu[(size_t)p * 2 * I + b * 128 + i], u = gu[(size_t)p * 2 * I + I + b * 128 + i];
+    const int pos = b * 128 + i;
+    const float g = gu[(size_t)p * 2 * I + 2 * pos], u = gu[(size_t)p * 2 * I + 2 * pos + 1];
     const float gc = tanhf(g / gate_cap) * gate_cap;
     const float uc = tanhf(u / up_cap) * up_cap;
     s[i] = gc / (1.f + expf(-g)) * uc * (float)signs[i];
@@ -331,6 +338,79 @@ extern "C" __global__ void __launch_bounds__(256) inkling2_control(float* out, c
 extern "C" __global__ void inkling2_softcap(float* y, const float* x, long long n, float cap) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = tanhf(x[i] / cap) * cap;
+}
+
+// ---- the decode path: one token at a time, against the keys and values of the slots it has already seen ----
+
+// The short convolution of one token, with the three-row history (`past`, [3, C], oldest first) shifted in place.
+// Same arithmetic as inkling2_sconv at T=1; the shift is what makes one launch per token enough.
+extern "C" __global__ void __launch_bounds__(256) inkling2_sconv_dec(float* y, const float* x, const ik_bf16* w,
+                                                                   const float* dyn_w, float* past, int C, int heads,
+                                                                   float div) {
+    const int c = (int)blockIdx.x * 256 + threadIdx.x;
+    if (c >= C) return;
+    const int h = c / (C / heads);
+    // Tap 0 is the current token; taps 1..3 are the three rows of the history, newest first.
+    const float v[4] = {x[c], past[(size_t)2 * C + c], past[(size_t)C + c], past[c]};
+    float acc = 0.f;
+#pragma unroll
+    for (int lag = 0; lag < 4; ++lag) {
+        float wj = dyn_w ? ik_bf2f(w[(size_t)lag * C + c]) : ik_bf2f(w[(size_t)c * 4 + (3 - lag)]);
+        if (dyn_w) wj += dyn_w[(size_t)h * 4 + lag];
+        acc += wj * v[lag];
+    }
+    y[c] = (x[c] + acc) / div;
+    past[c] = past[(size_t)C + c];
+    past[(size_t)C + c] = past[(size_t)2 * C + c];
+    past[(size_t)2 * C + c] = x[c];
+}
+
+// The relative-position bias of one query row at `pos`, over the `nk` keys starting at `k0`: bias is [heads, nk].
+// The keys outside the layer's relative extent get 0, like the whole-prompt kernel.
+extern "C" __global__ void __launch_bounds__(256) inkling2_rel_bias_dec(float* bias, const float* rel,
+                                                                      const float* proj, int pos, int k0, int nk,
+                                                                      int heads, int d_rel, int extent) {
+    const long long idx = (long long)blockIdx.x * 256 + threadIdx.x;
+    if (idx >= (long long)heads * nk) return;
+    const int h = (int)(idx / nk), s = (int)(idx % nk);
+    const int d = pos - (k0 + s);
+    float acc = 0.f;
+    if (d >= 0 && d < extent) {
+        const float* rp = rel + (size_t)h * d_rel;
+        for (int i = 0; i < d_rel; ++i) acc += rp[i] * proj[(size_t)i * extent + d];
+    }
+    bias[idx] = acc;
+}
+
+// One query against the cached keys: k and v are [max_ctx, nkv, dim] with `nk` valid rows from `k0`, q, gate and
+// out are [heads, dim], bias is [heads, nk] and sink is [heads]. The softmax runs online (max and running sum
+// rescaled per key), so the cache length is not bounded by the shared memory the whole-prompt kernel needs.
+extern "C" __global__ void __launch_bounds__(128) inkling2_attn_dec(float* out, const float* q, const float* k,
+                                                                  const float* v, const float* bias, const float* sink,
+                                                                  const float* gate, int k0, int nk, int heads,
+                                                                  int nkv, int dim, float scale) {
+    __shared__ float red[128];
+    const int h = blockIdx.x, kh = h / (heads / nkv), r = threadIdx.x;
+    const float qv = q[(size_t)h * dim + r];
+    const float g = gate ? gate[(size_t)h * dim + r] : 1.f;
+    // The sink is the score of a virtual key whose value is zero: it only enters the denominator.
+    float m = sink ? sink[h] : -INFINITY, l = sink ? 1.f : 0.f, acc = 0.f;
+    for (int i = 0; i < nk; ++i) {
+        const size_t s = (size_t)(k0 + i) * nkv + kh;
+        red[r] = qv * k[s * dim + r];
+        __syncthreads();
+        for (int o = 64; o > 0; o >>= 1) {
+            if (r < o) red[r] += red[r + o];
+            __syncthreads();
+        }
+        const float sc = red[0] * scale + bias[(size_t)h * nk + i];
+        const float mn = fmaxf(m, sc), k1 = __expf(m - mn), e = __expf(sc - mn);
+        l = l * k1 + e;
+        acc = acc * k1 + e * v[s * dim + r];
+        m = mn;
+        __syncthreads();
+    }
+    out[(size_t)h * dim + r] = acc / l / (1.f + expf(-g));
 }
 
 // MoE combine: y[t][i] += w[t] * x[t][i]. The route weight of one expert for every token, applied as the expert's

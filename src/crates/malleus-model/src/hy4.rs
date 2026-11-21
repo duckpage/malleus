@@ -2266,6 +2266,7 @@ pub(crate) fn new_session(model: &crate::engine::Model, max_ctx: usize) -> Resul
         idx_list: None,
         ple_snap: None,
         ngram_prev: Vec::new(),
+        inkling2: None,
         hy4_spec: None,
         hy4_draft: Default::default(),
         ix_tk: Vec::new(),

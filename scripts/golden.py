@@ -148,6 +148,8 @@ def load_on_gpu(model_dir: str):
     from transformers import AutoConfig, AutoModelForImageTextToText
 
     cfg = AutoConfig.from_pretrained(model_dir)
+    if cfg.model_type.startswith("inkling2"):
+        return load_inkling2_on_gpu(model_dir)
     with torch.device("cuda"):
         model = AutoModelForImageTextToText.from_config(cfg, dtype=torch.bfloat16)
     params = dict(model.named_parameters())
@@ -169,6 +171,32 @@ def load_on_gpu(model_dir: str):
     return model
 
 
+def load_inkling2_on_gpu(model_dir: str):
+    """Inkling-2 ships quantized expert weights (NVFP4/MXFP8) that `from_pretrained` dequantizes on the host.
+
+    Reading the shards on the GPU keeps the dequantization on the device: the host stays at ~32 GB while the
+    expanded bf16 weights (~40 GiB) land in GTT. This is the memory-safe path for the LXC host.
+    """
+    import transformers.modeling_utils as mu
+    from transformers import AutoModelForImageTextToText
+
+    orig = mu.safe_open
+
+    def safe_open_gpu(*a, **kw):
+        kw["device"] = "cuda:0"
+        return orig(*a, **kw)
+
+    mu.safe_open = safe_open_gpu
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_dir, dtype=torch.bfloat16, device_map="cuda"
+        )
+    finally:
+        mu.safe_open = orig
+    model.eval()
+    return model
+
+
 def save_f32(path: Path, t: torch.Tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
     t.detach().float().cpu().contiguous().numpy().tofile(path)
@@ -182,6 +210,10 @@ def main():
     ap.add_argument("--greedy-tokens", type=int, default=256)
     ap.add_argument("--skip-images", action="store_true")
     ap.add_argument("--skip-greedy", action="store_true")
+    ap.add_argument("--reasoning-effort", default=None,
+                    help="template reasoning effort for models that use it (inkling2: none|low|...)")
+    ap.add_argument("--loop-passes", type=int, default=None,
+                    help="inkling2: override loop_num_passes (1 = the base graph, for debugging)")
     args = ap.parse_args()
 
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -193,6 +225,9 @@ def main():
     proc = AutoProcessor.from_pretrained(args.model)
     t0 = time.time()
     model = load_on_gpu(args.model)
+    if args.loop_passes is not None and hasattr(model.config, "text_config"):
+        model.config.text_config.loop_num_passes = args.loop_passes
+        model.model.language_model.config.loop_num_passes = args.loop_passes
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
 
     meta = {"transformers": transformers.__version__, "torch": torch.__version__, "dtype": "bfloat16", "text": [], "images": []}
@@ -203,6 +238,7 @@ def main():
             else:
                 msgs = [{"role": "user", "content": text}]
                 ids = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False,
+                                               reasoning_effort=args.reasoning_effort,
                                                tokenize=True, return_tensors="pt", return_dict=True)["input_ids"]
             ids = ids.to("cuda")
             logits = model(input_ids=ids).logits[0].float()
@@ -226,7 +262,8 @@ def main():
             imgs = make_images(out / "images")
             for name, im in imgs.items():
                 msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": IMAGE_QUESTIONS[name]}]}]
-                prompt = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, tokenize=False)
+                prompt = proc.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False,
+                                                  reasoning_effort=args.reasoning_effort, tokenize=False)
                 inp = proc(text=[prompt], images=[im], return_tensors="pt").to("cuda")
                 pv = inp["pixel_values"]
                 grid = inp["image_grid_thw"]
