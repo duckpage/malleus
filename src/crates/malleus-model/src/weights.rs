@@ -33,6 +33,11 @@ pub(crate) fn i8_kernel(t: usize, glu: bool) -> (&'static str, usize, usize) {
 
 pub enum Weights {
     Bf16(DeviceBuffer),
+    /// One sign per weight with an e4m3 scale per 32 (1.25 bpw): the format that makes a 763B backbone resident.
+    Mls1 {
+        q: DeviceBuffer,
+        sc: DeviceBuffer,
+    },
     /// 2-bit codes with an fp16 scale per group of 128: the routed experts of Qwen3.8-Flash-Next (MLS2).
     Mls2 {
         q: DeviceBuffer,
@@ -137,6 +142,8 @@ pub(crate) fn mls4_rows(q4: &DeviceBuffer, s4: &DeviceBuffer, ids: &[u32], n_src
 /// both of its paths on the copy until one lands.
 pub(crate) fn mls8_of(l: &Linear) -> Result<(&DeviceBuffer, &DeviceBuffer)> {
     match (&l.w, &l.prefill) {
+        (Weights::Mls1 { .. }, _) => bail!("MLS1 weights have no int8 form"),
+        (Weights::Mls2 { .. }, Some((q, sc))) => Ok((q, sc)),
         (Weights::Mls8 { q, sc }, _) => Ok((q, sc)),
         (_, Some((q, sc))) => Ok((q, sc)),
         (Weights::Mls4 { .. }, None) => bail!("MLS4 weights and no MLS8 prefill copy"),

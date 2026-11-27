@@ -300,6 +300,8 @@ impl DflashDraft {
 /// Bytes of one weight tensor, for the size report.
 fn weights_bytes(w: &Weights) -> usize {
     match w {
+        // MLS1 is a DeepSeek format: a draft head does not carry one.
+        Weights::Mls1 { .. } => 0,
         Weights::Bf16(b) => b.len(),
         Weights::Mls2 { q, sc } | Weights::Mls4 { q, sc } | Weights::Mls3 { q, sc } | Weights::Mls8 { q, sc } => {
             q.len() + sc.len()

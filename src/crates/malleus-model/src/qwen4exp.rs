@@ -318,6 +318,7 @@ pub(crate) fn permute_hc_rows(
 pub(crate) fn permute_hc_up(l: &mut Linear, cnt: usize, hidden: usize) -> Result<bool> {
     let k = l.k;
     match &mut l.w {
+        Weights::Mls1 { .. } => {}
         Weights::Mls8 { q, sc } => permute_hc_rows(q, sc, l.n, k, 4, cnt, hidden)?,
         Weights::Mls4 { q, sc } => {
             permute_hc_rows(q, sc, l.n, k / 2, 2 * (k / malleus_gguf::quant::BLOCK), cnt, hidden)?

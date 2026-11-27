@@ -132,6 +132,10 @@ impl Uploader {
                 sc: self.typed(src, &format!("{pn}.scales"), DType::F32, &[n])?,
             },
             DType::BF16 => Weights::Bf16(self.tensor(src, &wn, &[n, k])?),
+            DType::Mls1 => Weights::Mls1 {
+                q: self.typed(src, &wn, DType::Mls1, &[n, k])?,
+                sc: self.typed(src, &format!("{wn}.scales"), DType::F8E4M3, &[n, k / 32])?,
+            },
             DType::Mls2 => Weights::Mls2 {
                 q: self.typed(src, &wn, DType::Mls2, &[n, k])?,
                 sc: self.typed(src, &format!("{wn}.scales"), DType::F16, &[n, g])?,
@@ -197,6 +201,7 @@ impl Uploader {
         // Bytes one row of the codes takes, and one row of the scales (None: a plain fp16 matrix).
         let (row_bytes, scale_row) = match info.dtype {
             DType::BF16 => (2 * k, None),
+            DType::Mls1 => (k / 8, Some(k / 32)),
             DType::Mls2 => (k / 4, Some(2 * groups)),
             DType::Mls3 => (k / 8 * 3, Some(2 * groups)),
             DType::Mls4 => (k / 2, Some(2 * groups)),
@@ -212,6 +217,7 @@ impl Uploader {
                 let sn = format!("{wn}.scales");
                 self.copy_range(src, &sn, row0 * sr, n * sr, &mut s, 0)?;
                 match dt {
+                    DType::Mls1 => Weights::Mls1 { q: codes, sc: s },
                     DType::Mls2 => Weights::Mls2 { q: codes, sc: s },
                     DType::Mls3 => Weights::Mls3 { q: codes, sc: s },
                     DType::Mls8 => Weights::Mls8 { q: codes, sc: s },

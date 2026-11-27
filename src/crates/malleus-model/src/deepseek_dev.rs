@@ -195,7 +195,8 @@ impl WindowAttn {
         fn lin(l: &Linear) -> usize {
             match &l.w {
                 Weights::Bf16(b) => b.len(),
-                Weights::Mls2 { q, sc }
+                Weights::Mls1 { q, sc }
+                | Weights::Mls2 { q, sc }
                 | Weights::Mls3 { q, sc }
                 | Weights::Mls4 { q, sc }
                 | Weights::Mls8 { q, sc } => q.len() + sc.len(),
@@ -620,7 +621,8 @@ impl BlockDev {
         fn lin(l: &Linear) -> usize {
             match &l.w {
                 Weights::Bf16(b) => b.len(),
-                Weights::Mls2 { q, sc }
+                Weights::Mls1 { q, sc }
+                | Weights::Mls2 { q, sc }
                 | Weights::Mls3 { q, sc }
                 | Weights::Mls4 { q, sc }
                 | Weights::Mls8 { q, sc } => q.len() + sc.len(),
@@ -1871,5 +1873,62 @@ mod tests {
         );
         assert!(worst_att > 0.9999, "the compressed attention diverges: {worst_att}");
         assert!(worst_out > 0.9999, "the layer's output diverges: {worst_out}");
+    }
+
+    /// The 1-bit file on the device: one expert's `w1` read by `gemv_mls1` against the host's dequantisation of the
+    /// same bytes. This is the gate to being resident at all — 103 GB instead of 162 — and to the 10-20 tok/s the
+    /// whole effort is for.
+    ///
+    ///   DEEPSEEK_FILE=/golden/deepseek-1bit.malleus \
+    ///     cargo test -p malleus-model --release -- --ignored --nocapture the_device_reads_the_one_bit_file
+    #[test]
+    #[ignore = "reads the 1-bit file and needs the GPU"]
+    fn the_device_reads_the_one_bit_file() {
+        let file = std::env::var("DEEPSEEK_FILE").expect("DEEPSEEK_FILE");
+        let g = malleus_gguf::gguf::Gguf::open(std::path::Path::new(&file)).unwrap();
+        let c = Config::from_json(
+            g.meta_str("openmalleus.hf_config").unwrap(),
+            g.meta_str("openmalleus.generation_config").ok(),
+        )
+        .unwrap();
+        let name = "layers.0.ffn.experts.0.w1.weight";
+        let info = g.info(name).unwrap();
+        assert_eq!(info.dtype, malleus_gguf::DType::Mls1, "{name}: {:?}", info.dtype);
+        let (n, k) = (info.shape[0], info.shape[1]);
+        let x: Vec<f32> = {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            (0..k)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / 8388608.0) - 1.0
+                })
+                .collect()
+        };
+        // The host's product with the same weights, dequantised from the same bytes.
+        let w = crate::deepseek_text::load_matrix(&g, name, n, k).unwrap();
+        let want = crate::hostmath::linear(&x, 1, k, &w, n, None);
+
+        let kernels = Kernels::load(&select_device().unwrap()).unwrap();
+        let m = Model::host_only(c.clone(), kernels, 0, malleus_gguf::quant::HADAMARD_SEED).unwrap();
+        let mut up = Uploader::new().unwrap();
+        up.use_prefill = false;
+        let lin = up.linear(&g, "layers.0.ffn.experts.0.w1", n, k).unwrap();
+        let xr = DeviceBuffer::alloc(8 * k * 4).unwrap();
+        let xh = DeviceBuffer::alloc(8 * k * 2).unwrap();
+        let xsc = DeviceBuffer::alloc(8 * k.div_ceil(128) * 4).unwrap();
+        let x_dev = DeviceBuffer::from_slice(&x).unwrap();
+        let out = DeviceBuffer::zeroed(n * 4).unwrap();
+        m.gemm(&m.stream, &xr, &xh, &xsc, &out, Act::X(&x_dev), &lin, 1, false)
+            .unwrap();
+        m.stream.synchronize().unwrap();
+        let got = out.download::<f32>(n).unwrap();
+        let (rms, worst) = rms_and_worst(&want, &got);
+        eprintln!(
+            "{name} (MLS1): cosine {:.8}, rms {rms:.4}, max |diff| {worst:.2e}",
+            cos(&got, &want)
+        );
+        assert!(cos(&got, &want) > 0.9999, "the 1-bit GEMV diverges");
     }
 }

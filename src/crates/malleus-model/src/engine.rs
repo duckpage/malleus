@@ -1277,6 +1277,7 @@ impl Model {
                 (Weights::Mls3 { .. }, None) => {
                     bail!("MLS3 prefill (W3A8) is not wired yet: docs/ling3-engine.md, increment I7")
                 }
+                (Weights::Mls1 { .. }, _) => bail!("MLS1 has no int8 prefill path (W1A8): the decode GEMV only"),
                 (Weights::Mls2 { .. }, None) => bail!("MLS2 is a routed-expert format, not a dense prefill weight"),
                 (Weights::Bf16(_), _) => unreachable!(),
             };
@@ -1350,6 +1351,7 @@ impl Model {
         }
         if t >= WMMA_MIN_TOKENS {
             let (q, sc, int8) = match (&w.w, &w.prefill) {
+                (Weights::Mls1 { .. }, _) => bail!("MLS1 has no WMMA path yet: it runs on the decode GEMV"),
                 (_, Some((q, sc))) => (q, sc, 1i32),
                 (Weights::Mls4 { q, sc }, None) => (q, sc, 0),
                 (Weights::Mls8 { q, sc }, None) => (q, sc, 1),
@@ -1428,6 +1430,8 @@ impl Model {
             // is no fused-rotation variant of them yet (docs/model-ling3-flash.md, § MLS3: da fare).
             (Weights::Mls3 { q, sc }, _, 1) => ("gemv_mls3", q, sc),
             (Weights::Mls3 { q, sc }, _, _) => ("gemm_mls3", q, sc),
+            (Weights::Mls1 { q, sc }, _, 1) => ("gemv_mls1", q, sc),
+            (Weights::Mls1 { q, sc }, _, _) => ("gemm_mls1", q, sc),
             (Weights::Mls2 { q, sc }, _, 1) => ("gemv_mls2", q, sc),
             (Weights::Mls2 { q, sc }, _, _) => ("gemm_mls2", q, sc),
             (Weights::Mls8 { q, sc }, _, 1..=GEMV_MAX_T) => (L8[t - 1], q, sc),
