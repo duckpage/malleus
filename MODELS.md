@@ -32,11 +32,45 @@ for prompt processing (twice the file, better prompts) or only the 4-bit ones.
 | Qwen3.6-35B-A3B (text + images) | `qwen36-35b-a3b-mls4.malleus` | 54.8 GB | **yes** (680 tensors) | Converted before `--prefill-int8` became opt-in: the name says `-mls4` but the file holds both copies. `malleus slim` rewrites it as 4-bit only. |
 | Ornith-1.5-35B-A3B (text + images) | `ornith-15-35b-a3b-mls4.malleus` | 20.3 GB | no | Production model until 2026-11-24; still served from the same `/models` as the fallback: 21.0 GB live, 5.6 GiB of session state and 5.3 GiB of working set at 262 144 tokens (28.7 GiB on a 93.4 GiB GTT). MTP head for speculative decoding. |
 | Ornith-1.5-122B (text + images) | `ornith-15-122b-mls4.malleus` | 66.8 GB | no | Does not fit resident next to the rest of the host (issue #14). With `MALLEUS_EXPERT_CACHE=24` the routed experts stay on NVMe: 44.6 GiB live, prefill streams all 59.8 GB of experts per chunk (issue #14). |
+| Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls4.malleus` | 124.6 GB | MLS8 dense copies (prefill) | **Production model since 2026-11-28 at `MALLEUS_CTX=524288`** (103.6 GiB planned, 95.9 GiB live after the warm-up): the session picks its own rotation, native up to 262144 and YaRN x2 above, so short requests keep the checkpoint's frequencies. 73.5 GB of weights on the device, the 49 GiB n-gram table read by row from the file. Prefill 1455/1555 tok/s at 1.5K/6K, 1390 at 262K, **1258 at 512K**; decode 62.1 tok/s at a fresh context, 58.7 at 32K, 46-63 on 512K requests. Retrieval verified at both windows (needle 10/10 and 10/10, `idx-recall` 12/12). Section below. |
 | Qwen3.8-Flash-Next (text) | `qwen38-flash-next-mls2.malleus` (mixed, opt-in) | 95 GB | no | gfx1151 only. Issue #37: routed gate/up at 2 bits (MLS2), down/dense at 4/8; 50.1 GB on the device. Golden 89.45 % all-position against 95.11 % of MLS4 and decode 35.7 against 37.8 tok/s, so it stays an experiment and not a production format. |
 | Hy4-flash (text + images) | `hy4-flash-mls4-mls8-dense.malleus` | 121.9 GB | **dense only** (406 tensors) | The 1M-window model. 90.5 GB on the device; golden 18/21, 89.95 % all-position, worst KL 1.247. The routed experts have no MLS8 copy: they do not fit. `MALLEUS_PREFILL_WEIGHTS=none` leaves the copies on the host. |
 | Ornith-1.5-35B-A3B-DFlash (draft) | `ornith-15-35b-a3b-dflash-mls4.malleus` | 0.2 GB | no | Speculative draft head (`malleus draft-info`); the MTP head inside the main file covers the common case. |
 | DeepSeek-V4.1-flash (text) | `deepseek-v41-flash-mls2.malleus` + `deepseek-v41-flash-engram.malleus` | 162.5 GB + 99.8 GB | no | Host graph only (issues #83, #121): no kernels yet, so it runs in f32 on the CPU at 6.5-13.6 s a token. 2-bit backbone (MLS2), the two Engram tables at 4 bits a row (`RowI4`). Served, not production. |
 | Inkling-2-Mini (text + images) | `inkling-2-mini-mls4.malleus` | 15.43 GB | no | **Production model since 2026-11-24**, at **`MALLEUS_CTX=131072`** since 2026-11-27 (18.7 GiB live, image `localhost/malleus:inkling2-256k` from `main` db4766e): a single MLS4 copy with the attention projections at 8 bits (`convert --int8-attn out`), which is what the eval asks for — **+6.50 % of perplexity and 91.10 % top-1** against +12.32 % and 89.86 % with every linear at 4 bits. Decode **16.1 tok/s** at a fresh context, 14.1 at 32K, 11.0 at 64K, 8.6 at 128K, 5.4 at 256K. The looped transformer (issue #70): 24 layers, the middle 12 run three times, 128 experts / 8 active, window 1024. The sliding streams' KV is a ring and the keys and values are int8 with one fp32 scale a (position, KV head) since #131. The vision tower runs (issue #74); the MTP head runs and is opt-in, accepts ~40-50 % of first drafts and stays off (#159). 256K fits the memory (22.7 GiB live) and the 256K fill is **1904 s = 31.7 min** since #150. |
+
+## Qwen3.8-Flash-Next — 512K, the production window (2026-11-28)
+
+The model we serve, at `MALLEUS_CTX=524288`, chunk 8192, MTP drafts and prompt lookup on (the defaults), prompt
+snapshots 8, n-gram table never warmed (its 49 GiB would evict themselves out of the 8 GiB reserved for it).
+
+The rotation is the session's (PR #164): a request whose bound (`prompt + max_tokens`) fits the checkpoint's 262 144
+positions runs on its native frequencies — bit-identical to the 262 144 configuration — and only a request that
+declares more gets YaRN x2. Most of the traffic is short, so this is what makes the window affordable.
+
+**Memory.** 103.6 GiB planned of 117.1 available: 67.1 weights + 20.0 state (39 KiB a position) + 8.4 working set
+(8192-token chunk) + 8.0 left to the table's page cache; 95.9 GiB live on the device after the warm-up. During a
+524 129-token fill `MemAvailable` never fell below 124.8 GiB and the process was not killed: a 16 384 chunk would ask
+110 GiB, and the measured live figure has run above the estimate on this host before (#8), so 8192 is the ceiling.
+
+**Retrieval at both windows** (criterion written before the run, in #146; natural Italian prose, five depths
+0.1-0.9 x two random keys, temperature 0, the reply must contain the full key):
+
+| window | requests | recalled | prefill | decode |
+|---|---|---|---|---|
+| 262 144 | 10 (262 584 tok) | **10 / 10** | 1388-1392 tok/s | 41-65 tok/s |
+| 524 288 | 10 (523 978 tok) | **10 / 10** | 1257 tok/s | 49-63 tok/s |
+
+`bench/idx-recall.sh` at 512K with YaRN x2: 12/12 indexer layers select the needle block in both fixtures
+(166/167 and 153/167 of the query rows, the last row a hit).
+
+**Gates on the shipped image** (`main` + the one-line `moe_sort` fix, #169): `golden --ctx 8192` last-token top-1
+20/21 and 4851/5193 (93.41 %), worst KL 0.30965; `golden-long` 11K 9610/11000 (87.36 %), KL 0.00044; `spec-exact`
+every verify row and the 96-token replay identical to the serial step.
+
+**Open:** the long-document perplexity beyond vs within 262 144 (needs a reference set the short golden does not
+have), and the MTP acceptance at x2 measured on a served request — speed questions, not correctness: `spec-exact`
+covers what the drafts may propose.
 
 ## Qwen3.8-Flash-Next — MLS2 (issue #37)
 
