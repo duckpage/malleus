@@ -2936,6 +2936,16 @@ fn run_mm(
         }
         None => (0, false),
     };
+    // A chunk that continues a cache reads the keys of its own earlier rows back from the session's ring, which is
+    // `window + PREFILL_CHUNK + DRAFT_ROWS + 1` rows deep: a longer piece would overwrite keys its own first rows
+    // still read, silently. The scheduler feeds pieces of `PREFILL_CHUNK`; this stops any other caller before the
+    // cache is corrupted instead of after.
+    let ring_depth = PREFILL_CHUNK + DRAFT_ROWS + 1;
+    ensure!(
+        pos == 0 || t <= ring_depth,
+        "inkling2: a cached chunk of {t} rows at position {pos} overruns the sliding ring ({ring_depth} rows): a \
+         chunk that continues a prefix goes in pieces of at most {PREFILL_CHUNK}"
+    );
     if let Some(k) = cache.as_deref_mut()
         && one
     {
