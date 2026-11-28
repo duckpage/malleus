@@ -675,7 +675,11 @@ extern "C" __global__ void __launch_bounds__(1024) moe_sort(int* offs, int* perm
         }
         offs[E1] = o;
         ntiles[0] = n;
-        if (BM2 > 0) ntiles[1] = n2;
+        // Both counters are written in both modes: the grouped GEMM launches its second list unconditionally and
+        // bounds it with `ntiles[1]`, so leaving it untouched means the caller reads whatever the buffer held before
+        // — a recycled buffer holds the previous request's count, and the tiles that follow are its tiles (issue
+        // #167: a GPU page fault in moe_w4a8 on the second of two prefills).
+        ntiles[1] = (BM2 > 0) ? n2 : 0;
     }
     __syncthreads();
     for (int p = threadIdx.x; p < P; p += 1024) {
