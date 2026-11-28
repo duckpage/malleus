@@ -31,14 +31,26 @@ const WORKING_SET_FIXED: u64 = 2 * GIB;
 /// disk until it is rebooted (issue #106: 33.5 GiB asked of the 33.6 GiB a 96 GiB host had left).
 const HOST_SLACK: u64 = 2 * GIB;
 
-/// `MemTotal` / `MemAvailable` from `/proc/meminfo`, in bytes.
+/// The memory a run may plan with, in bytes, and every source it was derived from.
+///
+/// Several things claim to know how much the host has, and in a container they disagree: `/proc/meminfo` is whatever
+/// the runtime serves (with lxcfs in front of it, the *parent's* numbers — this host reports 93.4 GiB of `MemTotal`
+/// inside the container against the 32 GiB it has, issue #166), the driver's GTT window is an address-space promise
+/// and not RAM (#106), and a cgroup limit may be tighter than both. The budget is the smallest `total` any source
+/// promises and the smallest `available`; `MALLEUS_HOST_RAM_GIB` overrides them, because in production no automatic
+/// detection can be trusted more than a number the operator wrote down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemInfo {
     pub total: u64,
     pub available: u64,
-    /// Where the numbers come from: `"gtt"`, `"ram"`, or `"gtt+ram"` when the driver's window was the wider of
-    /// the two and the RAM the kernel reports is what is left.
-    pub window: &'static str,
+    /// `MemTotal` of `/proc/meminfo` as this process sees it, when readable.
+    pub ram_total: Option<u64>,
+    /// `mem_info_gtt_total` of the widest card, when readable.
+    pub gtt_total: Option<u64>,
+    /// The cgroup's `memory.max`, when it is set and visible.
+    pub cgroup_total: Option<u64>,
+    /// `MALLEUS_HOST_RAM_GIB`, when the operator set it.
+    pub host_ram: Option<u64>,
 }
 
 impl MemInfo {
@@ -55,34 +67,97 @@ impl MemInfo {
                 Some(kib * 1024)
             })
         }
+        let total = field(text, "MemTotal:")?;
         Some(MemInfo {
-            total: field(text, "MemTotal:")?,
+            total,
             available: field(text, "MemAvailable:")?,
-            window: "ram",
+            ram_total: Some(total),
+            gtt_total: None,
+            cgroup_total: None,
+            host_ram: None,
         })
     }
 
-    /// What this host can still hand to the GPU, and the narrower of the two windows that say so. On an APU the
-    /// weights live in GTT, so the driver's `mem_info_gtt_*` is the promise that matters; but a GTT window wider than
-    /// the RAM the kernel reports is not memory the host has (an APU whose window covers the whole address space, an
-    /// LXC that fakes `/proc/meminfo` small), and a run that believes it does not fail cleanly: it evicts the page
-    /// cache and the machine streams from disk until it is rebooted (`serve --ctx 524288` on Inkling-2 at 33 GiB
-    /// asked, issue #106). The smaller `MemAvailable` wins, and the line says which one it was.
+    /// Every source that answered, with its own number, for the pre-flight line: a plan that is refused has to say
+    /// which of them it believed.
+    pub fn sources(&self) -> String {
+        let g = |b: u64| format!("{:.1} GiB", b as f64 / GIB as f64);
+        let mut out = Vec::new();
+        if let Some(t) = self.ram_total {
+            out.push(format!("MemTotal {}", g(t)));
+        }
+        if let Some(t) = self.gtt_total {
+            out.push(format!("gtt {}", g(t)));
+        }
+        if let Some(t) = self.cgroup_total {
+            out.push(format!("cgroup {}", g(t)));
+        }
+        if let Some(t) = self.host_ram {
+            out.push(format!("MALLEUS_HOST_RAM_GIB {}", g(t)));
+        }
+        out.join(", ")
+    }
+
+    /// What this host can hand to the GPU, from every source that answers plus the operator's override.
     pub fn read() -> Option<MemInfo> {
         let ram = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|t| Self::parse(&t));
-        Self::narrow(Self::read_gtt(), ram)
+        let gtt = Self::read_gtt();
+        let cgroup = Self::read_cgroup();
+        let over = std::env::var("MALLEUS_HOST_RAM_GIB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|g| *g > 0.0)
+            .map(|g| (g * GIB as f64) as u64);
+        let info = Self::choose(over, ram.as_ref(), gtt.as_ref(), cgroup.as_ref())?;
+        if let (Some(set), Some(detected)) = (
+            over,
+            [ram.as_ref(), gtt.as_ref(), cgroup.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|m| m.total)
+                .min(),
+        ) && set > detected
+        {
+            eprintln!(
+                "memory: MALLEUS_HOST_RAM_GIB is {:.1} GiB, above the {:.1} GiB the host itself reports: the plan \
+                 uses the value you set",
+                gib(set),
+                gib(detected)
+            );
+        }
+        Some(info)
     }
 
-    /// The narrower of the two windows: the smaller `MemAvailable` wins, and `total` follows the same window so the
-    /// printed pair stays one budget.
-    fn narrow(gtt: Option<MemInfo>, ram: Option<MemInfo>) -> Option<MemInfo> {
-        match (gtt, ram) {
-            (Some(g), Some(r)) if r.available < g.available => Some(MemInfo { ..r }),
-            (Some(g), Some(_)) => Some(MemInfo { window: "gtt+ram", ..g }),
-            (g, r) => g.or(r),
+    /// The budget: the smallest `total` and the smallest `available` among the sources that answered, then
+    /// `MALLEUS_HOST_RAM_GIB` when it is set (its `available` is still capped by what the sources report can be handed
+    /// out, so a written-down budget cannot promise memory the machine does not have free).
+    fn choose(
+        over: Option<u64>,
+        ram: Option<&MemInfo>,
+        gtt: Option<&MemInfo>,
+        cgroup: Option<&MemInfo>,
+    ) -> Option<MemInfo> {
+        let mut total: Option<u64> = None;
+        let mut available: Option<u64> = None;
+        for m in [ram, gtt, cgroup].into_iter().flatten() {
+            total = Some(total.map_or(m.total, |t: u64| t.min(m.total)));
+            available = Some(available.map_or(m.available, |a: u64| a.min(m.available)));
         }
+        let (total, available) = (total?, available?);
+        let (total, available) = match over {
+            Some(set) => (set, available.min(set)),
+            None => (total, available),
+        };
+        Some(MemInfo {
+            total,
+            available,
+            ram_total: ram.map(|m| m.total),
+            gtt_total: gtt.map(|m| m.total),
+            cgroup_total: cgroup.map(|m| m.total),
+            host_ram: over,
+        })
     }
 
     /// `mem_info_gtt_total` / `mem_info_gtt_used` of the card with the widest window, in bytes.
@@ -95,15 +170,33 @@ impl MemInfo {
                 continue;
             };
             // Another card's window is not ours to promise, so the largest total is the one the engine runs on.
-            if best.is_none_or(|b| total > b.total) {
+            if best.is_none_or(|b| b.gtt_total.is_none_or(|t| total > t)) {
                 best = Some(MemInfo {
                     total,
                     available: total.saturating_sub(used),
-                    window: "gtt",
+                    ram_total: None,
+                    gtt_total: Some(total),
+                    cgroup_total: None,
+                    host_ram: None,
                 });
             }
         }
         best
+    }
+
+    /// The cgroup's `memory.max` and `memory.current` (v2), when the limit is a number.
+    fn read_cgroup() -> Option<MemInfo> {
+        let read = |p: &str| std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok();
+        let max = read("/sys/fs/cgroup/memory.max")?;
+        let used = read("/sys/fs/cgroup/memory.current").unwrap_or(0);
+        Some(MemInfo {
+            total: max,
+            available: max.saturating_sub(used),
+            ram_total: None,
+            gtt_total: None,
+            cgroup_total: Some(max),
+            host_ram: None,
+        })
     }
 }
 
@@ -359,10 +452,10 @@ pub fn check(label: &str, ctx: usize, usage: &Usage, info: Option<MemInfo>) -> R
         gib(usage.reserve),
         gib(usage.total()),
         info.map_or(String::new(), |i| format!(
-            ", {:.1} GiB available of {:.1} ({}, {:.1} after the slack)",
+            ", {:.1} GiB available of {:.1} ({}; {:.1} after the slack)",
             gib(i.available),
             gib(i.total),
-            i.window,
+            i.sources(),
             gib(available_for_a_run(i))
         ))
     );
@@ -471,31 +564,82 @@ mod tests {
         let m = MemInfo::parse(MEMINFO).unwrap();
         assert_eq!(m.total, 128_785_860 * 1024);
         assert_eq!(m.available, 122_971_191 * 1024);
-        assert_eq!(m.window, "ram");
+        assert_eq!(m.ram_total, Some(128_785_860 * 1024));
+        assert_eq!(m.sources(), "MemTotal 122.8 GiB");
+    }
+
+    /// The sources as the engine reads them on this host (issue #166): inside the container `/proc/meminfo` is lxcfs's
+    /// view of the *parent*, so `MemTotal` is the GTT window's 93.4 GiB while the machine has 32 GiB.
+    fn lxcfs(avail_gib: u64) -> MemInfo {
+        MemInfo {
+            total: 934 / 10 * GIB,
+            available: avail_gib * GIB,
+            ram_total: Some(934 / 10 * GIB),
+            gtt_total: None,
+            cgroup_total: None,
+            host_ram: None,
+        }
+    }
+
+    fn gtt(total_gib: u64, used_gib: u64) -> MemInfo {
+        MemInfo {
+            total: total_gib * GIB,
+            available: (total_gib - used_gib) * GIB,
+            ram_total: None,
+            gtt_total: Some(total_gib * GIB),
+            cgroup_total: None,
+            host_ram: None,
+        }
+    }
+
+    fn cgroup(max_gib: u64, used_gib: u64) -> MemInfo {
+        MemInfo {
+            total: max_gib * GIB,
+            available: (max_gib - used_gib) * GIB,
+            ram_total: None,
+            gtt_total: None,
+            cgroup_total: Some(max_gib * GIB),
+            host_ram: None,
+        }
     }
 
     #[test]
-    fn the_narrower_window_wins() {
-        // This host: the driver reports a 96 GiB GTT window, the kernel reports 32 GiB of RAM. The GTT window is
-        // not memory the host has, and a run that believes it freezes the machine (issue #106).
-        let gtt = MemInfo {
-            total: 96 * GIB,
-            available: 90 * GIB,
-            window: "gtt",
-        };
-        let ram = MemInfo::parse("MemTotal:       33554432 kB\nMemAvailable:   31200000 kB\n").unwrap();
-        let m = MemInfo::narrow(Some(gtt), Some(ram)).unwrap();
-        assert_eq!(m.window, "ram");
-        assert_eq!((m.total, m.available), (ram.total, ram.available));
-        // The usual APU: the window is the narrower one and stays the promise.
-        let big = MemInfo::parse(MEMINFO).unwrap();
-        let m = MemInfo::narrow(Some(gtt), Some(big)).unwrap();
-        assert_eq!(m.window, "gtt+ram");
-        assert_eq!((m.total, m.available), (gtt.total, gtt.available));
+    fn the_smallest_total_and_the_smallest_available_win() {
+        // This host: lxcfs says 93.4 GiB (and 46 GiB available), the driver's window is also 93.4 GiB with 44 GiB
+        // left. Neither is RAM, so the plan takes the smallest total it is told and the smallest available.
+        let ram = lxcfs(46);
+        let m = MemInfo::choose(None, Some(&ram), Some(&gtt(93, 49)), None).unwrap();
+        assert_eq!(m.total, ram.total);
+        assert_eq!(m.available, 44 * GIB);
+
+        // A cgroup limit tighter than both is the budget, and its own headroom is the available one.
+        let m = MemInfo::choose(None, Some(&ram), Some(&gtt(93, 49)), Some(&cgroup(16, 4))).unwrap();
+        assert_eq!(m.total, 16 * GIB);
+        assert_eq!(m.available, 12 * GIB);
+        assert!(m.sources().contains("cgroup 16.0 GiB"), "{}", m.sources());
+
         // One source missing is still one budget.
-        assert_eq!(MemInfo::narrow(Some(gtt), None).unwrap().window, "gtt");
-        assert_eq!(MemInfo::narrow(None, Some(ram)).unwrap().window, "ram");
-        assert!(MemInfo::narrow(None, None).is_none());
+        assert_eq!(MemInfo::choose(None, Some(&ram), None, None).unwrap().total, ram.total);
+        assert_eq!(
+            MemInfo::choose(None, None, Some(&gtt(93, 49)), None).unwrap().total,
+            93 * GIB
+        );
+        assert!(MemInfo::choose(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn the_operator_budget_beats_the_detection_and_cannot_promise_free_memory() {
+        // The production quadlet writes down the 32 GiB the machine has: the total is that, and what can be handed
+        // out is still what the kernel says is free (it cannot be more than the budget).
+        let (ram, g) = (lxcfs(46), gtt(93, 49));
+        let m = MemInfo::choose(Some(32 * GIB), Some(&ram), Some(&g), None).unwrap();
+        assert_eq!(m.total, 32 * GIB);
+        assert_eq!(m.available, 32 * GIB);
+        // A budget larger than the free memory does not invent any.
+        let ram = lxcfs(6);
+        let m = MemInfo::choose(Some(32 * GIB), Some(&ram), None, None).unwrap();
+        assert_eq!((m.total, m.available), (32 * GIB, 6 * GIB));
+        assert!(m.sources().contains("MALLEUS_HOST_RAM_GIB 32.0 GiB"), "{}", m.sources());
     }
 
     #[test]
@@ -509,14 +653,14 @@ mod tests {
         let info = MemInfo {
             total: 34 * GIB,
             available: (3 * GIB) + HOST_SLACK - 1,
-            window: "ram",
+            ..lxcfs(0)
         };
         assert_eq!(available_for_a_run(info), 3 * GIB - 1);
         // Never negative, however little is left.
         let info = MemInfo {
             total: GIB,
             available: GIB / 2,
-            window: "ram",
+            ..lxcfs(0)
         };
         assert_eq!(available_for_a_run(info), 0);
     }
