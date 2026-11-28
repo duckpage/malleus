@@ -40,12 +40,16 @@ with no code, kernels or weight formats from any closed engine.
 
 ### Where it stands
 
-On the model we run in production ([MODELS.md](MODELS.md) for the full sweep and the method):
+On the model we run in production, Qwen3.8-Flash-Next at **512K of context** ([MODELS.md](MODELS.md) for the full
+sweep and the method):
 
-- **prefill of a long prompt**: 2.07x at a fresh session, 2.83x at 131 072 tokens against llama.cpp;
-- **decode**: parity kernel against kernel, ~20 % more in service thanks to the MTP head;
-- **quality**: the same distance from the bf16 checkpoint as llama.cpp's `Q4_K_M` — 13/19 against 14/19 of top-1 on
-  the golden prompts, and the greedy output is the closer one (11/52 against 6/52 tokens identical to bf16).
+- **prefill**: 1455 tok/s at 1.5K tokens, 1390 at 262K and **1258 at 512K** on one prompt;
+- **decode**: 62 tok/s at a fresh context, 58.7 at 32K, 46-63 on 512K requests, with the MTP head and the prompt
+  lookup;
+- **the window costs nothing to short prompts**: the session picks its own rotation (#164), so a request inside the
+  checkpoint's 262 144 positions runs on native frequencies, bit-identical to the 262K configuration;
+- **quality**: `golden` 20/21 and 93.41 % of all-position argmax against the bf16 checkpoint, worst KL 0.30965, and
+  retrieval verified at both windows (10/10 needle at 262K and at 512K, `idx-recall` 12/12).
 
 A dense model (Qwen3.8-27B) is bandwidth limited on both engines: Malleus measures ~5 % ahead (pp512 209.3
 against 191.7 tok/s, tg128 5.02 against 4.74), and the MTP head breaks the ~5.8 tok/s that ~80 GB/s allows a 4-bit
