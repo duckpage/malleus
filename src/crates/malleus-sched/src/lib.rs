@@ -1273,6 +1273,7 @@ impl Worker {
         // Greedy without penalties and without `logprobs`: the token is the argmax, computed on the device, and
         // the row never crosses the bus. Sampled or penalized requests keep the host fold.
         let greedy = self.step_argmax
+            && model.supports_step_argmax()
             && !act.req.logprobs
             && act.req.sampling.temperature <= 0.0
             && !act.req.sampling.penalizes();

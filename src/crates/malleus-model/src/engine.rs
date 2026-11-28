@@ -1827,8 +1827,26 @@ impl Model {
             !tokens.is_empty() && tokens.len() <= crate::weights::GEMV_MAX_T,
             "bad verify width"
         );
+        ensure!(
+            self.supports_step_argmax(),
+            "verify argmax: this family folds its logits on the host"
+        );
         let v = self.forward_impl(sess, tokens, None, tokens.len(), &[], true, true)?;
+        ensure!(
+            v.len() == tokens.len(),
+            "verify argmax: {} ids for {} rows",
+            v.len(),
+            tokens.len()
+        );
         Ok(v.iter().map(|&x| x as u32).collect())
+    }
+
+    /// Whether a greedy step can read back the argmax of every row instead of the logits row: the families whose
+    /// `forward_impl` runs the generic stack. Hy4, Inkling-2 and DeepSeek-V4.1 run their own graphs — the first
+    /// returns its logits on the host already, the others keep their own state — so a greedy step for them keeps the
+    /// host fold it always had.
+    pub fn supports_step_argmax(&self) -> bool {
+        self.hy4.is_none() && self.inkling2.is_none() && self.deepseek.is_none() && self.deepseek_dev.is_none()
     }
 
     /// Whether this model can run one token for several sessions in one pass over the weights: a flat model (no
