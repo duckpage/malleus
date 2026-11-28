@@ -1059,8 +1059,14 @@ impl Worker {
         // piece; what cannot be sliced is an insert, because `forward_mm` copies it whole. Inkling-2's looped graph
         // reads the prompt in one forward (chunked prefill is issue #74's third item), so it gets one piece.
         let total = req.prompt.len();
+        // Inkling-2 goes in pieces like every other family. The whole prompt in one forward is not faster — the
+        // pieces read the routed experts again for every 512 tokens but stay far from the bandwidth wall, and the
+        // measured fill is ~315 tok/s at 32K against 180.5 for the single forward — while its scratch grows with the
+        // prompt (~0.7 MiB a token): a 262144-token prompt asked for ~183 GiB on a host with a 93 GiB GTT window and
+        // 32 GiB of RAM. `PREFILL_CHUNK` is also the depth of the sliding cache's ring (`inkling2::slot_shape`) and
+        // the working set the pre-flight prices, so the three stay one number. Refs #165.
         let quantum = if self.model.is_inkling2() {
-            total.max(1)
+            malleus_model::inkling2::PREFILL_CHUNK
         } else {
             self.quantum
         };
